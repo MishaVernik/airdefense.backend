@@ -45,7 +45,6 @@ PyJWT==2.9.0
 pyparsing==3.1.2
 pyspnego==0.11.1
 python-dateutil==2.9.0.post0
-pywin32==306
 pyzmq==26.0.3
 qiskit==1.1.1
 qiskit-aer==0.14.2
