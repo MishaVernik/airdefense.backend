@@ -29,6 +29,7 @@ ALLOWED_HOSTS = [
     'localhost',
     '127.0.0.1',
     'airdefense-backend-ghexf2eagme5gfg5.eastus-01.azurewebsites.net',
+    'airdefense.cloud',
     # Add any other allowed hosts here
 ]
 
