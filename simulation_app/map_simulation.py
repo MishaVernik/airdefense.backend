@@ -12,6 +12,7 @@ from qiskit_algorithms import QAOA
 from qiskit_algorithms.optimizers import COBYLA
 from qiskit.primitives import Sampler
 from sklearn.decomposition import PCA
+from scipy.sparse import lil_matrix, coo_matrix
 
 n_shots = 100  # Global parameter for the number of evaluation shots
 max_qubits = 15  # Adjust this value to the maximum number of qubits you want to use
@@ -23,13 +24,14 @@ def clip_coordinates(x, y, height, width):
     y_clipped = np.clip(y, 0, width - 1)
     return x_clipped, y_clipped
 
+
 class Grid:
     """Represents the grid of the map."""
 
     def __init__(self, height, width):
         self.height = height
         self.width = width
-        self.grid = np.zeros((height, width), dtype=int)
+        self.grid = lil_matrix((height, width), dtype=int)
         self.missile_paths = []
         self.towers = []
         self.missiles = []
@@ -59,11 +61,14 @@ class Grid:
             self.grid[tower.x, tower.y] = 0
         self.towers = []
 
+
 class City:
     """Represents a city on the grid."""
+
     def __init__(self, x, y):
         self.x = int(x)
         self.y = int(y)
+
 
 class Missile:
     """Represents a missile on the grid."""
@@ -91,7 +96,6 @@ class Missile:
                 y -= 1
             path.append((x, y))  # Add each step to the path
         return path
-
 
     def get_direction(self):
         """Returns the direction of the missile towards the target city."""
@@ -142,6 +146,7 @@ class DefenseOptimization:
         self.cities = cities
         self.missiles = missiles
         self.towers = towers
+        self.previous_tower_locations = set()  # To track previous tower placements
 
     def optimize_tower_placement(self):
         """Finds the optimal placement of defensive towers using QAOA."""
@@ -170,13 +175,78 @@ class DefenseOptimization:
 
         return best_tower_locations, success_rate, qaoa_optimization_time + post_processing_time
 
+    def qaoa_optimize(self):
+        """Optimize the placement of towers using QAOA."""
+        qp = QuadraticProgram()
+
+        # Define variables for each possible tower location
+        for x in range(1, self.grid.height - 1):
+            for y in range(1, self.grid.width - 1):
+                qp.binary_var(f't_{x}_{y}')
+
+        # Objective function: maximize the number of neutralized missiles and penalize previous placements
+        linear = {}
+        for missile in self.missiles:
+            for x in range(1, self.grid.height - 1):
+                for y in range(1, self.grid.width - 1):
+                    var_name = f't_{x}_{y}'
+                    if any(tower.is_in_defense_range(missile.path) for tower in self.towers if
+                           tower.x == x and tower.y == y):
+                        tower = next(tower for tower in self.towers if tower.x == x and tower.y == y)
+                        if var_name in linear:
+                            linear[var_name] += tower.hit_probability
+                        else:
+                            linear[var_name] = tower.hit_probability
+
+                    # Apply a penalty if the tower was placed in the same location in previous iterations
+                    if (x, y) in self.previous_tower_locations:
+                        linear[var_name] -= 0.1  # Adjust penalty weight as needed
+
+        qp.maximize(linear=linear)
+
+        # Constraint: exactly `num_towers` towers
+        qp.linear_constraint(
+            linear={f't_{x}_{y}': 1 for x in range(1, self.grid.height - 1) for y in range(1, self.grid.width - 1)},
+            sense='==', rhs=len(self.towers))
+
+        # Convert to QUBO
+        qubo = QuadraticProgramToQubo().convert(qp)
+
+        # Use QAOA
+        sampler = Sampler()
+        optimizer = COBYLA()
+
+        # Progress callback function
+        def callback(eval_count, params, value, meta):
+            print(f"Iteration {eval_count}: Objective value = {value}")
+
+        qaoa = QAOA(sampler=sampler, optimizer=optimizer, reps=1, callback=callback)
+
+        optimizer.set_options(maxiter=5, disp=True)
+
+        result = MinimumEigenOptimizer(qaoa).solve(qubo)
+
+        # Extract best locations
+        best_locations = []
+        for x in range(1, self.grid.height - 1):
+            for y in range(1, self.grid.width - 1):
+                if result.x[qubo.variables_index[f't_{x}_{y}']] == 1:
+                    best_locations.append((x, y))
+
+        # Update the set of previous tower locations
+        self.previous_tower_locations.update(best_locations)
+
+        return best_locations
+
     def evaluate_tower_placement(grid, missiles):
         neutralized_missiles = 0
         for missile in tqdm(missiles, desc="Evaluating missiles"):
             hits = 0
             for _ in range(n_shots):
                 hit_probability_accumulated = 1.0
-                for (mx, my) in missile.path:
+                for i, (mx, my) in enumerate(missile.path):
+                    if i < 2:  # Ensure the missile has flown at least two steps before checking interception
+                        continue
                     for tower in grid.towers:
                         if tower.is_in_defense_range([(mx, my)]):
                             hit_probability_accumulated *= (1 - tower.hit_probability)
@@ -210,61 +280,6 @@ class DefenseOptimization:
         grid.clear_towers()
         for x, y in best_locations:
             grid.add_tower(x, y)
-
-    def qaoa_optimize(self):
-        """Optimize the placement of towers using QAOA."""
-        qp = QuadraticProgram()
-
-        # Define variables for each possible tower location
-        for x in range(1, self.grid.height - 1):
-            for y in range(1, self.grid.width - 1):
-                qp.binary_var(f't_{x}_{y}')
-
-        # Objective function: maximize the number of neutralized missiles
-        linear = {}
-        for missile in self.missiles:
-            for x in range(1, self.grid.height - 1):
-                for y in range(1, self.grid.width - 1):
-                    var_name = f't_{x}_{y}'
-                    if any(tower.is_in_defense_range(missile.path) for tower in self.towers if
-                           tower.x == x and tower.y == y):
-                        tower = next(tower for tower in self.towers if tower.x == x and tower.y == y)
-                        if var_name in linear:
-                            linear[var_name] += tower.hit_probability
-                        else:
-                            linear[var_name] = tower.hit_probability
-        qp.maximize(linear=linear)
-
-        # Constraint: exactly `num_towers` towers
-        qp.linear_constraint(
-            linear={f't_{x}_{y}': 1 for x in range(1, self.grid.height - 1) for y in range(1, self.grid.width - 1)},
-            sense='==', rhs=len(self.towers))
-
-        # Convert to QUBO
-        qubo = QuadraticProgramToQubo().convert(qp)
-
-        # Use QAOA
-        sampler = Sampler()
-        optimizer = COBYLA()
-
-        # Progress callback function
-        def callback(eval_count, params, value, meta):
-            print(f"Iteration {eval_count}: Objective value = {value}")
-
-        qaoa = QAOA(sampler=sampler, optimizer=optimizer, reps=1, callback=callback)
-
-        optimizer.set_options(maxiter=5, disp=True)
-
-        result = MinimumEigenOptimizer(qaoa).solve(qubo)
-
-        # Extract best locations
-        best_locations = []
-        for x in range(1, self.grid.height - 1):
-            for y in range(1, self.grid.width - 1):
-                if result.x[qubo.variables_index[f't_{x}_{y}']] == 1:
-                    best_locations.append((x, y))
-
-        return best_locations
 
 
 def classical_optimize(grid, cities, missiles, num_towers):
@@ -356,8 +371,6 @@ def optimize_tower_placement_with_qaoa(grid, missiles):
 
     return best_locations
 
-
-
 def compare_solutions(test_case_name, grid, cities, missiles, towers):
     """Compare the solutions from QAOA and classical approaches."""
     print(f"\n--- {test_case_name} ---")
@@ -427,7 +440,6 @@ def simulation_to_json(grid, missiles, iteration):
     return {"simulation_data": simulation_data}
 
 
-
 def reduce_dimensions(data, max_qubits):
     """Reduce the dimensions of the data using PCA to fit within max allowed qubits."""
     n_samples, n_features = data.shape
@@ -437,6 +449,7 @@ def reduce_dimensions(data, max_qubits):
     reduced_data = pca.fit_transform(data)
 
     return reduced_data
+
 
 def encode_data(cities, missiles, towers, max_qubits, height, width):
     """Encode the data using PCA to fit within max allowed qubits."""
@@ -504,9 +517,24 @@ def random_case():
     print(simulation_json)  # or save to a file
 
 
+def generate_border_position(height, width):
+    # Choose a random side: 0 = top, 1 = bottom, 2 = left, 3 = right
+    side = np.random.randint(0, 4)
+
+    if side == 0:  # Top border
+        return (0, np.random.randint(0, width))
+    elif side == 1:  # Bottom border
+        return (height - 1, np.random.randint(0, width))
+    elif side == 2:  # Left border
+        return (np.random.randint(0, height), 0)
+    else:  # Right border
+        return (np.random.randint(0, height), width - 1)
+
+
 def run_simulation(height, width, TIME, num_cities, num_missiles, num_towers, max_iterations=4):
-    cities = [City(np.random.randint(0, height), np.random.randint(0, width)) for _ in range(num_cities)]
-    missiles = [Missile(np.random.randint(0, height), np.random.randint(0, width), random.choice(cities), TIME) for _ in
+    cities = [City(np.random.randint(1, height), np.random.randint(1, width)) for _ in range(num_cities)]
+
+    missiles = [Missile(*generate_border_position(height, width), random.choice(cities), TIME) for _ in
                 range(num_missiles)]
 
     grid = Grid(height, width)
@@ -523,18 +551,25 @@ def run_simulation(height, width, TIME, num_cities, num_missiles, num_towers, ma
 
     for iteration in range(max_iterations):
         print(f"\n--- Iteration {iteration + 1} ---")
-        # Evaluate the current tower placement
+
+        # Run simulation and evaluate the current tower placement
         evaluate_tower_placement(grid, missiles)
 
         # Store data for this iteration
         iteration_data = simulation_to_json(grid, missiles, iteration + 1)
         all_iterations_data.append(iteration_data["simulation_data"])
 
-        # Optimize tower placement using QAOA for the next iteration
+        # Optimize tower placement using data from the current iteration
         best_tower_locations = optimize_tower_placement_with_qaoa(grid, missiles)
+
+        # Update grid with new tower placements
         grid.clear_towers()
         for x, y in best_tower_locations:
             grid.add_tower(x, y)
+
+        # Recompute missile paths based on new tower placements
+        for missile in missiles:
+            missile.path = missile.compute_path(TIME)  # Recompute the missile path
 
     # Combine all iteration data into a single JSON structure
     simulation_json = {"simulation_data": [data for iteration in all_iterations_data for data in iteration]}

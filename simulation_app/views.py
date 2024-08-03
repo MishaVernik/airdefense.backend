@@ -7,7 +7,7 @@ def run_simulation_view(request):
         width = 5
         TIME = 10
         num_cities = 3
-        num_missiles = 1
+        num_missiles = 2
         num_towers = 1
 
         simulation_data = run_simulation(height, width, TIME, num_cities, num_missiles, num_towers)
