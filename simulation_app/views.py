@@ -11,9 +11,10 @@ def run_simulation_view(request):
             grid_size = int(data.get('gridSize', 5))
             num_towers = int(data.get('numTowers', 2))
             num_missiles = int(data.get('numMissiles', 2))
+            num_cities = int(data.get('numCities', 2))
 
             # Run the simulation with the provided parameters
-            simulation_result = run_simulation(height=grid_size, width=grid_size, TIME=10, num_cities=1, num_missiles=num_missiles, num_towers=num_towers, max_iterations=4)
+            simulation_result = run_simulation(height=grid_size, width=grid_size, TIME=10, num_cities=num_cities, num_missiles=num_missiles, num_towers=num_towers, max_iterations=4)
 
             return JsonResponse(simulation_result, safe=False)
 
