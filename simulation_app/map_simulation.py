@@ -139,75 +139,54 @@ class Tower:
 
 
 class DefenseOptimization:
-    """Represents the optimization problem for placing defensive towers."""
-
-    def __init__(self, grid, cities, missiles, towers):
+    def __init__(self, grid, cities, missiles, num_towers):
         self.grid = grid
         self.cities = cities
         self.missiles = missiles
-        self.towers = towers
-        self.previous_tower_locations = set()  # To track previous tower placements
+        self.num_towers = num_towers
+        self.previous_tower_positions = set()
 
-    def optimize_tower_placement(self):
-        """Finds the optimal placement of defensive towers using QAOA."""
-        start_time = time.time()
-        best_tower_locations = self.qaoa_optimize()
-        end_time = time.time()
-        qaoa_optimization_time = end_time - start_time
-        print(f"QAOA optimization time: {qaoa_optimization_time:.2f} seconds")
-
-        # Clear existing towers from the grid
-        self.grid.clear_towers()
-
-        # Add best towers to the grid
-        for x, y in best_tower_locations:
-            # Find the corresponding tower from the input towers to get the radius and hit probability
-            for tower in self.towers:
-                if tower.x == x and tower.y == y:
-                    self.grid.add_tower(x, y, tower.radius, tower.hit_probability)
-                    break
-
-        start_time = time.time()
-        success_rate = self.evaluate_tower_placement()
-        end_time = time.time()
-        post_processing_time = end_time - start_time
-        print(f"Post-processing time: {post_processing_time:.2f} seconds")
-
-        return best_tower_locations, success_rate, qaoa_optimization_time + post_processing_time
+    def optimize_tower_positions(self):
+        best_positions = self.qaoa_optimize()
+        return best_positions
 
     def qaoa_optimize(self):
-        """Optimize the placement of towers using QAOA."""
         qp = QuadraticProgram()
 
         # Define variables for each possible tower location
-        for x in range(1, self.grid.height - 1):
-            for y in range(1, self.grid.width - 1):
+        for x in range(self.grid.height):
+            for y in range(self.grid.width):
                 qp.binary_var(f't_{x}_{y}')
 
-        # Objective function: maximize the number of neutralized missiles and penalize previous placements
+        # Objective function: maximize the coverage and minimize clustering
         linear = {}
-        for missile in self.missiles:
-            for x in range(1, self.grid.height - 1):
-                for y in range(1, self.grid.width - 1):
-                    var_name = f't_{x}_{y}'
-                    if any(tower.is_in_defense_range(missile.path) for tower in self.towers if
-                           tower.x == x and tower.y == y):
-                        tower = next(tower for tower in self.towers if tower.x == x and tower.y == y)
-                        if var_name in linear:
-                            linear[var_name] += tower.hit_probability
-                        else:
-                            linear[var_name] = tower.hit_probability
+        for x in range(self.grid.height):
+            for y in range(self.grid.width):
+                var_name = f't_{x}_{y}'
+                coverage_score = 0
 
-                    # Apply a penalty if the tower was placed in the same location in previous iterations
-                    if (x, y) in self.previous_tower_locations:
-                        linear[var_name] -= 0.1  # Adjust penalty weight as needed
+                # Maximize coverage of cities
+                for city in self.cities:
+                    if self.is_within_range(x, y, city.x, city.y):
+                        coverage_score += 2
+
+                # Maximize interception of missile paths
+                for missile in self.missiles:
+                    if any(self.is_within_range(x, y, px, py) for px, py in missile.path):
+                        coverage_score += 1
+
+                # Penalize repeating tower positions
+                if (x, y) in self.previous_tower_positions:
+                    coverage_score -= 0.5
+
+                linear[var_name] = coverage_score
 
         qp.maximize(linear=linear)
 
         # Constraint: exactly `num_towers` towers
         qp.linear_constraint(
-            linear={f't_{x}_{y}': 1 for x in range(1, self.grid.height - 1) for y in range(1, self.grid.width - 1)},
-            sense='==', rhs=len(self.towers))
+            linear={f't_{x}_{y}': 1 for x in range(self.grid.height) for y in range(self.grid.width)},
+            sense='==', rhs=self.num_towers)
 
         # Convert to QUBO
         qubo = QuadraticProgramToQubo().convert(qp)
@@ -215,71 +194,24 @@ class DefenseOptimization:
         # Use QAOA
         sampler = Sampler()
         optimizer = COBYLA()
-
-        # Progress callback function
-        def callback(eval_count, params, value, meta):
-            print(f"Iteration {eval_count}: Objective value = {value}")
-
-        qaoa = QAOA(sampler=sampler, optimizer=optimizer, reps=1, callback=callback)
-
-        optimizer.set_options(maxiter=5, disp=True)
-
+        qaoa = QAOA(sampler=sampler, optimizer=optimizer, reps=1)
         result = MinimumEigenOptimizer(qaoa).solve(qubo)
 
         # Extract best locations
-        best_locations = []
-        for x in range(1, self.grid.height - 1):
-            for y in range(1, self.grid.width - 1):
+        best_positions = []
+        for x in range(self.grid.height):
+            for y in range(self.grid.width):
                 if result.x[qubo.variables_index[f't_{x}_{y}']] == 1:
-                    best_locations.append((x, y))
+                    best_positions.append((x, y))
 
-        # Update the set of previous tower locations
-        self.previous_tower_locations.update(best_locations)
+        # Update the set of previous tower positions
+        self.previous_tower_positions.update(best_positions)
 
-        return best_locations
+        return best_positions
 
-    def evaluate_tower_placement(grid, missiles):
-        neutralized_missiles = 0
-        for missile in tqdm(missiles, desc="Evaluating missiles"):
-            hits = 0
-            for _ in range(n_shots):
-                hit_probability_accumulated = 1.0
-                for i, (mx, my) in enumerate(missile.path):
-                    if i < 2:  # Ensure the missile has flown at least two steps before checking interception
-                        continue
-                    for tower in grid.towers:
-                        if tower.is_in_defense_range([(mx, my)]):
-                            hit_probability_accumulated *= (1 - tower.hit_probability)
-                if hit_probability_accumulated < 1:
-                    hits += 1
-            if hits > n_shots / 2:  # Consider the missile intercepted if more than half of the shots result in a hit
-                missile.defended_by_air_defense = True
-                neutralized_missiles += 1
-            else:
-                missile.hit_target = True
-        return neutralized_missiles / len(missiles)
-
-    def adjust_towers(grid, missiles):
-        best_locations = []
-        max_interceptions = 0
-
-        for _ in range(10):  # Adjust up to 10 times
-            possible_locations = [(x, y) for x in range(grid.height) for y in range(grid.width)]
-            grid.clear_towers()
-
-            # Randomly choose tower positions
-            chosen_locations = random.sample(possible_locations, len(grid.towers))
-            for x, y in chosen_locations:
-                grid.add_tower(x, y)
-
-            interceptions = evaluate_tower_placement(grid, missiles)
-            if interceptions > max_interceptions:
-                max_interceptions = interceptions
-                best_locations = chosen_locations
-
-        grid.clear_towers()
-        for x, y in best_locations:
-            grid.add_tower(x, y)
+    def is_within_range(self, tower_x, tower_y, target_x, target_y):
+        distance = np.sqrt((tower_x - target_x) ** 2 + (tower_y - target_y) ** 2)
+        return distance <= 2  # Assume the tower's effective range is 2 units
 
 
 def classical_optimize(grid, cities, missiles, num_towers):
